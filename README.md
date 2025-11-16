@@ -1,5 +1,7 @@
 # XIV LivePoser - Blender Addon
 
+Get the latest release here: https://github.com/link-0402/XIV-LivePose-Importer/releases/tag/1.0
+
 A Blender addon for importing and applying FFXIV LivePose files to armatures, enabling easy pose adjustments for animations created in-game.
 This tool is meant to be used primarily for permanent, simple animation editing rather than the semi-temporary animation-unspecific method that SimpleHeels already provides through livepose. 
 
