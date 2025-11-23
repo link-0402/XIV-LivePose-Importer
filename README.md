@@ -16,11 +16,11 @@ I am in no way associated with the developers behind SimpleHeels, this is just a
   - Position only
   - Scale only
   - Rotation + Position
-- **Animation Support**: Apply LivePose offsets to entire animation actions across all keyframes
-- **Invert Transformations**: Remove previously applied LivePose data
+- **Animation Support**: Apply LivePose offsets to entire animation actions across all keyframes, optionally only for select bones
 - **GLTF Import/Export**: Streamlined workflow with automatic cleanup of unnecessary objects
-- **Action Management**: Delete individual or all animation actions
-- **Automatic Armature Setup**: Automatically configures Mannequin mesh with armature modifier
+- **Action Management**: Delete individual or all animation actions (to reset the scene or make identifying the correct timeline on re-import ingame easier)
+- **Automatic Armature Setup**: Automatically configures "Mannequin", "Face" and "Tail" meshes with armature modifier on import
+- **Animation normalization / cleanup**: Cleans up the timeline in case of misplaced keyframes, putting evently spaced keyframes across the length of the animation in order to make them game compatible
 
 ## Requirements
 
