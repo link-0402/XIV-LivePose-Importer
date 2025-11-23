@@ -40,61 +40,35 @@ I am in no way associated with the developers behind SimpleHeels, this is just a
 
 ### Basic Workflow
 
-1. **Select Target Armature**
+0. Export the animation from the game through either XAT (no clue) or VFXEdit (PapEditor Tab -> load pap file -> Motion)
+   You need to load up the correct skeleton for the animation now, otherwise there will be issues. 
+   Figuring out which one is correct can be a bit of trial and error, I usually try the IVCS 0101 (Midlander M) or or YAS / YAS+NLFB 0201 (Midlander F) and 0801 (Miqo'te F) skeletons.
+   Keep in mind that if you use a skeleton that's not for Midlander Female, most Mannequins will deform unnaturally, but the animation itself might still be completely fine. You'll get a feel for it as you go. 
+   Export the animation. Make sure to export all bones, including unused ones.
+
+2. **Select Target Armature**
    - In the 3D Viewport sidebar (press `N`), navigate to the "LivePose" tab
    - Import a GLTF file through the importer
-   - Select your target armature from the dropdown
+   - Select your target armature from the dropdown (if it didn't happen automatically)
+   - Set the armature under the armature modifier of your Mannequin if you want a preview (recommended). If the body is called "Mannequin" this will happen automatically.
 
-2. **Load LivePose File**
+3. **Load LivePose File**
    - Click the folder icon to browse for your `.livepose` file
    - LivePose files are JSON format exported from FFXIV tools
 
-3. **Choose Apply Mode**
+4. **Choose Apply Mode**
    - Select which transformations to apply (default: Rotation Only)
-   - Toggle "Apply to Animation" to apply the pose across all keyframes
-   - Toggle "Invert (Remove)" to undo a previously applied pose
+     I would recommend only using rotations or an offset to the root bone (n_hara) to do height adjustments, everything else looks unnatural.
+   - You can toggle off adjustments for certain bones contained within the livepose file from the list if necessary
 
-4. **Apply the Pose**
+5. **Apply the Pose**
    - Click "Apply LivePose" to apply transformations
+   - I recommend inspecting the animation / timeline in Pose Mode afterwards. If it contains too many or incorrectly placed keyframes hit "Normalize Animation", that will correct the timeline and provide evenly spaced keyframes across the entire animation. 
    - Export the animation and re-import it ingame
 
-### GLTF Workflow
-
-**Import GLTF:**
-- Click "Import GLTF" to import animation files
-- The addon automatically removes unnecessary objects:
-  - `glTF_not_exported` collection
-  - `Icosphere` object
-  - `DUMMY_MESH` object
-- Automatically sets imported armature as target
-
-**Export GLTF:**
-- Set export folder path
-- Enter filename (`.gltf` extension added automatically)
-- Click "Export GLTF" to export with optimized settings
-- Export includes animations with reset pose bones between actions
-
-### Action Management
-
-- **Delete Other Actions**: Removes all actions except the currently active one
-- **Delete All Actions**: Removes all animation actions from the project
-
-## Apply Modes Explained
-
-- **All**: Applies position, rotation, and scale transformations
-- **Rotation Only**: Only applies bone rotations (most common for poses)
-- **Position Only**: Only applies bone location offsets
-- **Scale Only**: Only applies bone scale transformations
-- **Rotation + Position**: Applies both rotation and position (common for character poses)
-
-## Animation Application
-
-When "Apply to Animation" is enabled:
-- LivePose transformations are applied to all keyframes in the active action
-- Each frame is processed individually to preserve animation timing
-- New keyframes are inserted only where values change
-- Progress is reported showing number of bones and frames modified
-
+6. Import the pose back into the game, once again selecting all bones, including previously unused ones.
+   If the feet / toes or genitalia deform unnaturally, you might need to add them to a bone exclusion list. See https://xivmodding.com/books/ff14-asset-reference-document/page/bone-list-and-bone-scaling-notes for the list of bones.
+  
 ## Technical Details
 
 ### LivePose File Format
