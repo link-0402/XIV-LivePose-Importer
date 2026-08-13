@@ -13,8 +13,10 @@
 
 import bpy
 import json
+import math
 import mathutils
 import os
+import struct
 import base64
 import zlib
 from collections import defaultdict
@@ -312,6 +314,382 @@ def get_readable_bone_name(bone_name):
     return BONE_NAME_MAPPING.get(bone_name, bone_name)
 
 
+# ---------------------------------------------------------------------------
+# LivePose transform math
+#
+# In-game (Caraxi/LivePose, SkeletonService.ApplySnapshot), each stack of a
+# .livepose file is applied to the bone's MODEL-SPACE transform (i.e. the
+# transform relative to the skeleton root), not the bone-local transform:
+#
+#   model.Position += stack.Position                      (model space)
+#   model.Rotation  = model.Rotation * stack.Rotation     (post-multiplied)
+#   model.Scale    += stack.Scale
+#
+# Bones are processed parents-first and (with the usual Propogate=3 flag)
+# children follow their parent's model-space change.
+#
+# A GLTF exported by XAT/VFXEdit stores raw game (havok) local transforms in
+# its nodes, so the glTF scene space is identical to the game's model space.
+# Blender's glTF importer converts every node TRS into Blender coordinates
+# (glTF Y-up -> Blender Z-up, V = +90deg about X) and gives every bone a
+# "bone direction" correction C(b) (rotation only):
+#
+#   pose_matrix(b) = V @ NodeGlobal(b) @ V^-1 @ C(b)
+#
+# For the default 'BLENDER' bone heuristic C(b) == V for every bone.
+# If the source .gltf/.glb path is known, C(b) is computed exactly from the
+# file's bind pose, which makes the math correct for any import heuristic.
+# ---------------------------------------------------------------------------
+
+# glTF -> Blender axis conversion (+90 deg about X)
+LIVEPOSE_V_QUAT = mathutils.Quaternion((math.sqrt(0.5), math.sqrt(0.5), 0.0, 0.0))
+
+
+def _get_v_mats():
+    v = LIVEPOSE_V_QUAT.to_matrix().to_4x4()
+    return v, v.inverted()
+
+
+def _node_trs_to_matrix(node):
+    """Convert a glTF node's local TRS/matrix to a mathutils Matrix."""
+    if 'matrix' in node:
+        # glTF matrices are column-major
+        return mathutils.Matrix(
+            (node['matrix'][0:4], node['matrix'][4:8], node['matrix'][8:12], node['matrix'][12:16])
+        ).transposed()
+    t = node.get('translation', [0.0, 0.0, 0.0])
+    r = node.get('rotation', [0.0, 0.0, 0.0, 1.0])  # x, y, z, w
+    s = node.get('scale', [1.0, 1.0, 1.0])
+    quat = mathutils.Quaternion((r[3], r[0], r[1], r[2]))
+    return mathutils.Matrix.LocRotScale(mathutils.Vector(t), quat, mathutils.Vector(s))
+
+
+def _read_glb_json(filepath):
+    """Extract the JSON chunk of a .glb file."""
+    with open(filepath, 'rb') as f:
+        magic, version, _length = struct.unpack('<4sII', f.read(12))
+        if magic != b'glTF':
+            raise ValueError('Not a GLB file')
+        chunk_len, chunk_type = struct.unpack('<I4s', f.read(8))
+        if chunk_type != b'JSON':
+            raise ValueError('First GLB chunk is not JSON')
+        return json.loads(f.read(chunk_len).decode('utf-8'))
+
+
+def _parse_gltf_bind_globals(filepath):
+    """Parse a .gltf/.glb file and return {node_name: bind global Matrix} in
+    glTF (game) coordinates, or None on failure."""
+    try:
+        if filepath.lower().endswith('.glb'):
+            data = _read_glb_json(filepath)
+        else:
+            with open(filepath, 'r', encoding='utf-8-sig') as f:
+                data = json.load(f)
+
+        nodes = data.get('nodes', [])
+        parent = {}
+        for i, node in enumerate(nodes):
+            for child in node.get('children', []):
+                parent[child] = i
+
+        locals_mat = [_node_trs_to_matrix(n) for n in nodes]
+
+        globals_mat = {}
+
+        def compute_global(i):
+            if i in globals_mat:
+                return globals_mat[i]
+            p = parent.get(i)
+            if p is None:
+                globals_mat[i] = locals_mat[i]
+            else:
+                globals_mat[i] = compute_global(p) @ locals_mat[i]
+            return globals_mat[i]
+
+        result = {}
+        for i, node in enumerate(nodes):
+            name = node.get('name')
+            if name:
+                result[name] = compute_global(i)
+        return result
+    except Exception as e:
+        print(f"LivePose: could not parse source glTF for bone corrections: {e}")
+        return None
+
+
+def compute_bone_corrections(armature, source_gltf_path=None):
+    """Compute the per-bone correction C(b) such that
+        pose_matrix(b) = V @ NodeGlobal(b) @ V^-1 @ C(b)
+    Returns {bone_name: 4x4 rotation Matrix}.
+    Falls back to C = V (default 'BLENDER' import heuristic) for every bone.
+    """
+    v_mat, v_inv = _get_v_mats()
+    corrections = {}
+
+    bind_globals = None
+    if source_gltf_path and os.path.exists(source_gltf_path):
+        bind_globals = _parse_gltf_bind_globals(source_gltf_path)
+
+    for bone in armature.data.bones:
+        c = None
+        if bind_globals is not None and bone.name in bind_globals:
+            try:
+                # matrix_local = V @ BindGlobal @ V^-1 @ C  =>  C = (V BG V^-1)^-1 @ matrix_local
+                conv_bg = v_mat @ bind_globals[bone.name] @ v_inv
+                c_full = conv_bg.inverted() @ bone.matrix_local
+                # correction is a pure rotation; drop numerical residue
+                _t, r, _s = c_full.decompose()
+                c = r.to_matrix().to_4x4()
+            except Exception:
+                c = None
+        if c is None:
+            c = v_mat.copy()
+        corrections[bone.name] = c
+    return corrections
+
+
+def bone_topo_order(armature):
+    """All bone names, parents before children."""
+    order = []
+
+    def visit(bone):
+        order.append(bone.name)
+        for child in bone.children:
+            visit(child)
+
+    for bone in armature.data.bones:
+        if bone.parent is None:
+            visit(bone)
+    return order
+
+
+def collect_livepose_deltas(livepose_data, armature, enabled_bones=None):
+    """Extract per-bone stack deltas from parsed LivePose JSON.
+
+    Returns {bone_name: [(d_pos, d_quat, d_scale), ...]} in game coordinates,
+    with stacks kept in file order. Bones missing from the armature are
+    returned in 'skipped'.
+    """
+    bone_deltas = {}
+    skipped = []
+    for bone_data in livepose_data['Data']:
+        if 'BonePoseInfoId' not in bone_data or 'Stacks' not in bone_data:
+            continue
+
+        bone_name = bone_data['BonePoseInfoId']['BoneName']
+
+        if enabled_bones is not None and len(enabled_bones) > 0 and bone_name not in enabled_bones:
+            continue
+
+        if bone_name not in armature.pose.bones:
+            skipped.append(bone_name)
+            continue
+
+        stacks = []
+        for stack in bone_data['Stacks']:
+            if 'Transform' not in stack:
+                continue
+            transform = stack['Transform']
+            pos = transform.get('Position', {})
+            rot = transform.get('Rotation', {})
+            scl = transform.get('Scale', {})
+            d_pos = mathutils.Vector((pos.get('X', 0.0), pos.get('Y', 0.0), pos.get('Z', 0.0)))
+            # LivePose stores quaternions as XYZW, Blender uses WXYZ
+            d_quat = mathutils.Quaternion((
+                rot.get('W', 1.0), rot.get('X', 0.0), rot.get('Y', 0.0), rot.get('Z', 0.0)
+            ))
+            d_quat.normalize()
+            d_scale = mathutils.Vector((scl.get('X', 0.0), scl.get('Y', 0.0), scl.get('Z', 0.0)))
+            stacks.append((d_pos, d_quat, d_scale))
+
+        if stacks:
+            bone_deltas[bone_name] = stacks
+
+    return bone_deltas, skipped
+
+
+def filter_deltas_for_mode(stacks, apply_mode, invert=False):
+    """Filter stack deltas by apply mode and optionally invert them.
+
+    Inversion applies the stacks in reverse order with negated components
+    (the exact inverse of the forward composition).
+    """
+    want_pos = apply_mode in ('ALL', 'POSITION', 'ROT_POS')
+    want_rot = apply_mode in ('ALL', 'ROTATION', 'ROT_POS')
+    want_scl = apply_mode in ('ALL', 'SCALE')
+
+    result = []
+    for d_pos, d_quat, d_scale in stacks:
+        result.append((
+            d_pos.copy() if want_pos else mathutils.Vector((0.0, 0.0, 0.0)),
+            d_quat.copy() if want_rot else mathutils.Quaternion((1.0, 0.0, 0.0, 0.0)),
+            d_scale.copy() if want_scl else mathutils.Vector((0.0, 0.0, 0.0)),
+        ))
+
+    if invert:
+        inverted = []
+        for d_pos, d_quat, d_scale in reversed(result):
+            inverted.append((-d_pos, d_quat.conjugated(), -d_scale))
+        result = inverted
+    return result
+
+
+class LivePoseBakeState:
+    """Per-frame model-space application of LivePose deltas on an armature.
+
+    Usage: create once per apply operation, then call process_frame() after
+    each scene.frame_set(). Adjusted channels for delta bones are written to
+    the pose bones (caller keyframes them if desired).
+
+    Forward application: a delta bone's base pose is computed from its
+    already-adjusted parent (children follow their parent - "Propogate").
+
+    Invert (removal): the animation currently contains the forward-baked
+    result. A baked local was created relative to the parent's FORWARD pose,
+    so a delta bone's base must be its evaluated (still-adjusted) pose,
+    not a pose recomputed from its already-reverted parent.
+    """
+
+    def __init__(self, armature, bone_deltas, apply_mode, invert=False, source_gltf_path=None):
+        self.armature = armature
+        self.apply_mode = apply_mode
+        self.invert = invert
+        self.v_mat, self.v_inv = _get_v_mats()
+        self.corrections = compute_bone_corrections(armature, source_gltf_path)
+        self.order = bone_topo_order(armature)
+
+        # rest data
+        self.rest_local = {}      # bone -> armature-space rest matrix
+        self.rel_rest = {}        # bone -> rest matrix relative to parent
+        self.no_inherit_scale = set()
+        for bone in armature.data.bones:
+            self.rest_local[bone.name] = bone.matrix_local.copy()
+            if bone.parent is not None:
+                self.rel_rest[bone.name] = bone.parent.matrix_local.inverted() @ bone.matrix_local
+                if bone.inherit_scale == 'NONE':
+                    self.no_inherit_scale.add(bone.name)
+            else:
+                self.rel_rest[bone.name] = bone.matrix_local.copy()
+
+        # filtered deltas per bone
+        self.deltas = {
+            name: filter_deltas_for_mode(stacks, apply_mode, invert)
+            for name, stacks in bone_deltas.items()
+        }
+
+        self.pose_mats = {}       # bone -> post-delta armature-space matrix (current frame)
+        self.prev_quat = {}       # bone -> last written quaternion (sign continuity)
+
+        self.want_pos = apply_mode in ('ALL', 'POSITION', 'ROT_POS')
+        self.want_rot = apply_mode in ('ALL', 'ROTATION', 'ROT_POS')
+        self.want_scl = apply_mode in ('ALL', 'SCALE')
+
+    def _parent_mat(self, bone_name, parent_pose):
+        """Parent pose matrix for composing a child, honoring the child's
+        inherit_scale setting ('NONE' strips the parent's scale)."""
+        if bone_name in self.no_inherit_scale:
+            t, r, _s = parent_pose.decompose()
+            return mathutils.Matrix.LocRotScale(t, r, mathutils.Vector((1.0, 1.0, 1.0)))
+        return parent_pose
+
+    def process_frame(self):
+        """Compute adjusted pose for the current frame. Must be called after
+        scene.frame_set(); bones are processed parents-first."""
+        self.pose_mats = {}
+
+        # Read all channel values and compute the evaluated pose of every
+        # bone BEFORE writing anything (FK evaluation of the current action).
+        bases = {}
+        eval_pose = {}
+        for bone_name in self.order:
+            posebone = self.armature.pose.bones[bone_name]
+            bone = self.armature.data.bones[bone_name]
+            basis = posebone.matrix_basis.copy()
+            bases[bone_name] = basis
+            if bone.parent is not None and bone.parent.name in eval_pose:
+                eval_pose[bone_name] = self._parent_mat(bone_name, eval_pose[bone.parent.name]) @ self.rel_rest[bone_name] @ basis
+            else:
+                eval_pose[bone_name] = self.rest_local[bone_name] @ basis
+
+        for bone_name in self.order:
+            posebone = self.armature.pose.bones[bone_name]
+            bone = self.armature.data.bones[bone_name]
+            stacks = self.deltas.get(bone_name)
+            parent_name = bone.parent.name if bone.parent is not None else None
+
+            if self.invert:
+                # Removal: the animation currently holds the forward-baked
+                # result. A delta bone's base is its evaluated (still fully
+                # adjusted) pose; after removing its own stacks the bone holds
+                # its original local relative to the EVALUATED (pre-removal)
+                # parent, so the basis is written relative to that parent.
+                if not stacks:
+                    continue
+                base = eval_pose[bone_name]
+                new_pose = self._apply_stacks(bone_name, base, stacks)
+                if parent_name is not None and parent_name in eval_pose:
+                    parent_mat = self._parent_mat(bone_name, eval_pose[parent_name])
+                    basis_new = self.rel_rest[bone_name].inverted() @ parent_mat.inverted() @ new_pose
+                else:
+                    basis_new = self.rest_local[bone_name].inverted() @ new_pose
+                self._write_basis_values(posebone, basis_new)
+                self.pose_mats[bone_name] = new_pose
+                continue
+
+            # Forward application: children follow their already-adjusted
+            # parent (LivePose "Propogate" behaviour).
+            if parent_name is not None and parent_name in self.pose_mats:
+                base = self._parent_mat(bone_name, self.pose_mats[parent_name]) @ self.rel_rest[bone_name] @ bases[bone_name]
+            else:
+                base = self.rest_local[bone_name] @ bases[bone_name]
+
+            if stacks:
+                base = self._apply_stacks(bone_name, base, stacks)
+                if parent_name is not None and parent_name in self.pose_mats:
+                    parent_mat = self._parent_mat(bone_name, self.pose_mats[parent_name])
+                    basis_new = self.rel_rest[bone_name].inverted() @ parent_mat.inverted() @ base
+                else:
+                    basis_new = self.rest_local[bone_name].inverted() @ base
+                self._write_basis_values(posebone, basis_new)
+
+            self.pose_mats[bone_name] = base
+
+    def _apply_stacks(self, bone_name, base_pose, stacks):
+        """Apply the bone's stacks in game model space."""
+        c = self.corrections[bone_name]
+        # game model-space transform
+        node_global = self.v_inv @ base_pose @ c.inverted() @ self.v_mat
+        t, r, s = node_global.decompose()
+
+        for d_pos, d_quat, d_scale in stacks:
+            t = t + d_pos
+            r = r @ d_quat
+            r.normalize()
+            s = s + d_scale
+
+        node_global = mathutils.Matrix.LocRotScale(t, r, s)
+        return self.v_mat @ node_global @ self.v_inv @ c
+
+    def _write_basis_values(self, posebone, basis_new):
+        """Store an adjusted pose-bone basis on the pose bone (no keyframing
+        here)."""
+        loc, rot, scale = basis_new.decompose()
+
+        # quaternion sign continuity (avoid interpolation flips)
+        prev = self.prev_quat.get(posebone.name)
+        if prev is not None and rot.dot(prev) < 0:
+            rot.negate()
+        self.prev_quat[posebone.name] = rot.copy()
+
+        if self.want_pos:
+            posebone.location = loc
+        if self.want_rot:
+            posebone.rotation_mode = 'QUATERNION'
+            posebone.rotation_quaternion = rot
+        if self.want_scl:
+            posebone.scale = scale
+
+
 # CustomizePlus helper functions (adapted from sleepbnuuy's bustomize plugin)
 def translate_cplus_hash(cplus_hash: str):
     """Decode and parse CustomizePlus string"""
@@ -360,6 +738,55 @@ def reset_cplus_scaling(armature):
     for posebone in armature.pose.bones:
         posebone.bone.inherit_scale = 'FULL'
         posebone.scale = mathutils.Vector((1.0, 1.0, 1.0))
+
+
+def normalize_action_whole_frames(action):
+    """Resample all fcurves of the action so keys sit exactly on whole frames.
+
+    Imported glTF animations usually have keys at fractional frames (e.g.
+    238.9998 instead of 239) due to float precision. The glTF exporter
+    samples animations at whole frames, so keys must be whole-frame aligned
+    for baked content to survive the export.
+
+    Returns (start_frame, end_frame, normalized_curve_count) or None if the
+    action has no keyframes.
+    """
+    min_frame = float('inf')
+    max_frame = float('-inf')
+
+    for fcurve in action.fcurves:
+        for keyframe in fcurve.keyframe_points:
+            min_frame = min(min_frame, keyframe.co[0])
+            max_frame = max(max_frame, keyframe.co[0])
+
+    if min_frame == float('inf') or max_frame == float('-inf'):
+        return None
+
+    start_frame = int(round(min_frame))
+    end_frame = int(round(max_frame))
+
+    normalized_count = 0
+    for fcurve in action.fcurves:
+        if len(fcurve.keyframe_points) == 0:
+            continue
+
+        frame_values = {}
+        for frame in range(start_frame, end_frame + 1):
+            frame_values[frame] = fcurve.evaluate(frame)
+
+        while len(fcurve.keyframe_points) > 0:
+            fcurve.keyframe_points.remove(fcurve.keyframe_points[0])
+
+        for frame, value in sorted(frame_values.items()):
+            keyframe = fcurve.keyframe_points.insert(frame, value)
+            keyframe.interpolation = 'LINEAR'
+
+        normalized_count += 1
+
+    for fcurve in action.fcurves:
+        fcurve.update()
+
+    return start_frame, end_frame, normalized_count
 
 
 def clear_animation_scale_keyframes(action):
@@ -709,188 +1136,101 @@ class LIVEPOSE_OT_ApplyPose(bpy.types.Operator):
     def apply_to_current_pose(self, context, livepose_data, target_armature):
         """Apply LivePose to the current pose only"""
         settings = context.scene.livepose_settings
-        applied_count = 0
-        skipped_bones = []
-        
+
         # Build a set of enabled bones for quick lookup
         enabled_bones = {item.name for item in settings.bone_toggles if item.enabled}
-        
-        # DEBUG: Print first few bones for diagnostics
-        print("\n=== LivePose Application Debug ===")
-        
-        for bone_data in livepose_data['Data']:
-            if 'BonePoseInfoId' not in bone_data or 'Stacks' not in bone_data:
-                continue
-            
-            bone_name = bone_data['BonePoseInfoId']['BoneName']
-            
-            # Skip bones that are not enabled in the toggle list
-            if len(enabled_bones) > 0 and bone_name not in enabled_bones:
-                continue
-            
-            if bone_name not in target_armature.pose.bones:
-                skipped_bones.append(bone_name)
-                continue
-            
-            posebone = target_armature.pose.bones[bone_name]
-            
-            for stack in bone_data['Stacks']:
-                if 'Transform' not in stack:
-                    continue
-                
-                # DEBUG: Print rotation data for first few bones
-                if applied_count < 3 and 'Rotation' in stack['Transform']:
-                    rot = stack['Transform']['Rotation']
-                    print(f"\nBone: {bone_name}")
-                    print(f"  LivePose Quat (XYZW): X={rot['X']:.6f}, Y={rot['Y']:.6f}, Z={rot['Z']:.6f}, W={rot['W']:.6f}")
-                    print(f"  Current Blender Quat (WXYZ): {posebone.rotation_quaternion}")
-                
-                self.apply_transform_to_bone(posebone, stack['Transform'], settings.apply_mode, settings.invert_transform)
-                
-                # DEBUG: Print result
-                if applied_count < 3 and 'Rotation' in stack['Transform']:
-                    print(f"  After Apply: {posebone.rotation_quaternion}")
-                
-                applied_count += 1
-        
-        print("=== End Debug ===\n")
-        
+
+        bone_deltas, skipped_bones = collect_livepose_deltas(livepose_data, target_armature, enabled_bones)
+
+        if not bone_deltas:
+            self.report({'WARNING'}, "No matching bones found in LivePose data")
+            return {'CANCELLED'}
+
+        source_gltf = target_armature.get("livepose_source_gltf", None)
+        state = LivePoseBakeState(target_armature, bone_deltas, settings.apply_mode,
+                                  settings.invert_transform, source_gltf)
+
+        # Process the current frame (bones are handled parents-first internally)
+        context.view_layer.update()
+        state.process_frame()
+
+        applied_count = len(bone_deltas)
+
         if skipped_bones:
             self.report({'WARNING'}, f"Applied pose to {applied_count} bones. Skipped {len(skipped_bones)} missing bones: {', '.join(skipped_bones[:5])}{'...' if len(skipped_bones) > 5 else ''}")
         else:
             action_text = "Removed" if settings.invert_transform else "Applied"
             self.report({'INFO'}, f"Successfully {action_text.lower()} pose to {applied_count} bones")
-        
+
         settings.pose_was_applied = True
         return {'FINISHED'}
-    
+
     def apply_to_animation_action(self, context, livepose_data, target_armature):
         """Apply LivePose offset to all keyframes in the active action"""
         settings = context.scene.livepose_settings
         action = target_armature.animation_data.action
-        
+
         # Build a set of enabled bones for quick lookup
         enabled_bones = {item.name for item in settings.bone_toggles if item.enabled}
-        
-        # Build a dict of bone transforms from LivePose
-        bone_transforms = {}
-        for bone_data in livepose_data['Data']:
-            if 'BonePoseInfoId' not in bone_data or 'Stacks' not in bone_data:
-                continue
-            
-            bone_name = bone_data['BonePoseInfoId']['BoneName']
-            
-            # Skip bones that are not enabled in the toggle list
-            if len(enabled_bones) > 0 and bone_name not in enabled_bones:
-                continue
-            
-            if bone_name not in target_armature.pose.bones:
-                continue
-            
-            for stack in bone_data['Stacks']:
-                if 'Transform' in stack:
-                    bone_transforms[bone_name] = stack['Transform']
-                    break
-        
-        if not bone_transforms:
+
+        bone_deltas, skipped_bones = collect_livepose_deltas(livepose_data, target_armature, enabled_bones)
+
+        if not bone_deltas:
             self.report({'WARNING'}, "No matching bones found in LivePose data")
             return {'CANCELLED'}
-        
-        # Get all unique keyframes from ALL fcurves in the action
-        frame_numbers = set()
-        for fcurve in action.fcurves:
-            for keyframe in fcurve.keyframe_points:
-                frame_numbers.add(int(keyframe.co[0]))
-        
-        if not frame_numbers:
+
+        # Normalize the action so all keys sit on whole frames. Imported
+        # glTF animations usually have keys at fractional frames (e.g.
+        # 238.9998 instead of 239); keyframe insertion merges into those
+        # nearby keys and the glTF exporter only samples whole frames, so
+        # normalization is required for the bake to cover the full animation.
+        result = normalize_action_whole_frames(action)
+        if result is None:
             self.report({'WARNING'}, "No keyframes found in action")
             return {'CANCELLED'}
-        
-        frame_numbers = sorted(frame_numbers)
+
+        start_frame, end_frame, _ = result
+        frame_numbers = list(range(start_frame, end_frame + 1))
         original_frame = context.scene.frame_current
-        modified_bones = set()
-        
-        self.report({'INFO'}, f"Processing {len(frame_numbers)} frames from {min(frame_numbers)} to {max(frame_numbers)}")
-        
+
+        self.report({'INFO'}, f"Processing {len(frame_numbers)} frames from {frame_numbers[0]} to {frame_numbers[-1]}")
+
+        source_gltf = target_armature.get("livepose_source_gltf", None)
+        state = LivePoseBakeState(target_armature, bone_deltas, settings.apply_mode,
+                                  settings.invert_transform, source_gltf)
+
+        modified_bones = set(bone_deltas.keys())
+
         # Process each frame individually
         for frame in frame_numbers:
             # Set to the exact frame to ensure we're reading the correct keyframe values
             context.scene.frame_set(frame)
             # Force update to ensure pose is evaluated
             context.view_layer.update()
-            
-            for bone_name, transform in bone_transforms.items():
+
+            state.process_frame()
+
+            # Bake the adjusted channels for all delta bones
+            for bone_name in bone_deltas:
                 posebone = target_armature.pose.bones[bone_name]
-                
-                # Store original values before applying transform
-                original_loc = posebone.location.copy()
-                original_rot = posebone.rotation_quaternion.copy()
-                original_scale = posebone.scale.copy()
-                
-                # Apply the transform offset
-                self.apply_transform_to_bone(posebone, transform, settings.apply_mode, settings.invert_transform)
-                
-                # Insert keyframe to bake the offset (only if values changed)
-                if settings.apply_mode in ['ALL', 'POSITION', 'ROT_POS']:
-                    if posebone.location != original_loc:
-                        posebone.keyframe_insert(data_path="location", frame=frame)
-                if settings.apply_mode in ['ALL', 'ROTATION', 'ROT_POS']:
-                    posebone.rotation_mode = 'QUATERNION'
-                    if posebone.rotation_quaternion != original_rot:
-                        posebone.keyframe_insert(data_path="rotation_quaternion", frame=frame)
-                if settings.apply_mode in ['ALL', 'SCALE']:
-                    if posebone.scale != original_scale:
-                        posebone.keyframe_insert(data_path="scale", frame=frame)
-                
-                modified_bones.add(bone_name)
-        
+                if state.want_pos:
+                    posebone.keyframe_insert(data_path="location", frame=frame)
+                if state.want_rot:
+                    posebone.keyframe_insert(data_path="rotation_quaternion", frame=frame)
+                if state.want_scl:
+                    posebone.keyframe_insert(data_path="scale", frame=frame)
+
         # Restore original frame
         context.scene.frame_set(original_frame)
         context.view_layer.update()
-        
+
+        if skipped_bones:
+            self.report({'WARNING'}, f"Skipped {len(skipped_bones)} missing bones: {', '.join(skipped_bones[:5])}{'...' if len(skipped_bones) > 5 else ''}")
+
         action_text = "Removed" if settings.invert_transform else "Applied"
         self.report({'INFO'}, f"{action_text} LivePose offset to {len(modified_bones)} bones across {len(frame_numbers)} keyframes")
         settings.pose_was_applied = True
         return {'FINISHED'}
-    
-    def apply_transform_to_bone(self, posebone, transform, apply_mode, invert=False):
-        """Apply a transform to a pose bone"""
-        # Invert multiplier for remove operation
-        mult = -1.0 if invert else 1.0
-        
-        # Apply Position
-        if apply_mode in ['ALL', 'POSITION', 'ROT_POS'] and 'Position' in transform:
-            pos = transform['Position']
-            offset = mathutils.Vector((pos['X'], pos['Y'], pos['Z'])) * mult
-            posebone.location += offset
-        
-        # Apply Rotation (quaternion)
-        if apply_mode in ['ALL', 'ROTATION', 'ROT_POS'] and 'Rotation' in transform:
-            rot = transform['Rotation']
-            # Skip identity rotations
-            if not (rot.get('IsIdentity', False)):
-                posebone.rotation_mode = 'QUATERNION'
-                # LivePose stores quaternions as XYZW, Blender uses WXYZ
-                rot_quat = mathutils.Quaternion((
-                    rot['W'], rot['X'], rot['Y'], rot['Z']
-                ))
-                
-                # Normalize to ensure unit quaternion
-                rot_quat.normalize()
-                
-                if invert:
-                    # Apply inverse (conjugate) rotation for removal
-                    rot_quat.conjugate()
-                
-                # Apply rotation using post-multiply (current @ delta)
-                # This is the correct order for FFXIV LivePose data
-                posebone.rotation_quaternion @= rot_quat
-        
-        # Apply Scale
-        if apply_mode in ['ALL', 'SCALE'] and 'Scale' in transform:
-            scale = transform['Scale']
-            offset = mathutils.Vector((scale['X'], scale['Y'], scale['Z'])) * mult
-            posebone.scale += offset
 
 
 class LIVEPOSE_OT_ResetPose(bpy.types.Operator):
@@ -977,6 +1317,10 @@ class LIVEPOSE_OT_ImportGLTF(bpy.types.Operator, ImportHelper):
             
             # Set as target armature
             context.scene.livepose_settings.target_armature = armature
+
+            # Remember the source file so LivePose application can derive the
+            # exact per-bone corrections from its bind pose
+            armature["livepose_source_gltf"] = self.filepath
             
             # Set frame range based on imported animation
             if armature.animation_data and armature.animation_data.action:
@@ -994,9 +1338,11 @@ class LIVEPOSE_OT_ImportGLTF(bpy.types.Operator, ImportHelper):
                             frame_end = frame
                 
                 if frame_start is not None and frame_end is not None:
-                    context.scene.frame_start = int(frame_start)
-                    context.scene.frame_end = int(frame_end)
-                    self.report({'INFO'}, f"Set frame range: {int(frame_start)} to {int(frame_end)}")
+                    # Round (not truncate) so fractional keys like 238.9998
+                    # don't lose the actual last frame (239)
+                    context.scene.frame_start = int(round(frame_start))
+                    context.scene.frame_end = int(round(frame_end))
+                    self.report({'INFO'}, f"Set frame range: {int(round(frame_start))} to {int(round(frame_end))}")
             
             # Apply CustomizePlus scaling if enabled
             settings = context.scene.livepose_settings
@@ -1100,6 +1446,7 @@ class LIVEPOSE_OT_ExportGLTF(bpy.types.Operator):
                 export_reset_pose_bones=True,  # Reset Pose Bones between Actions
                 export_optimize_animation_size=True,  # Optimize Animation Size
                 export_anim_slide_to_zero=False,
+                export_frame_range=False,  # Export full action range, not the scene playback range
                 
                 # Performance optimizations - disable unnecessary features
                 export_cameras=False,  # Don't export cameras
@@ -1164,59 +1511,18 @@ class LIVEPOSE_OT_NormalizeAnimation(bpy.types.Operator):
             return {'CANCELLED'}
         
         action = target_armature.animation_data.action
-        
+
         # Get the frame range of the animation
         if len(action.fcurves) == 0:
             self.report({'WARNING'}, "Action has no fcurves to normalize")
             return {'CANCELLED'}
-        
-        # Find min and max frames across all fcurves
-        min_frame = float('inf')
-        max_frame = float('-inf')
-        
-        for fcurve in action.fcurves:
-            if len(fcurve.keyframe_points) > 0:
-                for keyframe in fcurve.keyframe_points:
-                    min_frame = min(min_frame, keyframe.co[0])
-                    max_frame = max(max_frame, keyframe.co[0])
-        
-        if min_frame == float('inf') or max_frame == float('-inf'):
+
+        result = normalize_action_whole_frames(action)
+        if result is None:
             self.report({'WARNING'}, "Could not determine frame range")
             return {'CANCELLED'}
-        
-        # Round to nearest whole frames
-        start_frame = int(round(min_frame))
-        end_frame = int(round(max_frame))
-        
-        # Process each fcurve
-        normalized_count = 0
-        for fcurve in action.fcurves:
-            if len(fcurve.keyframe_points) == 0:
-                continue
-            
-            # Store the interpolation values at each whole frame
-            frame_values = {}
-            for frame in range(start_frame, end_frame + 1):
-                # Evaluate the fcurve at this frame
-                value = fcurve.evaluate(frame)
-                frame_values[frame] = value
-            
-            # Clear existing keyframes
-            while len(fcurve.keyframe_points) > 0:
-                fcurve.keyframe_points.remove(fcurve.keyframe_points[0])
-            
-            # Add new keyframes at whole frame positions
-            for frame, value in sorted(frame_values.items()):
-                keyframe = fcurve.keyframe_points.insert(frame, value)
-                # Set interpolation to linear for consistency
-                keyframe.interpolation = 'LINEAR'
-            
-            normalized_count += 1
-        
-        # Update the fcurves
-        for fcurve in action.fcurves:
-            fcurve.update()
-        
+
+        start_frame, end_frame, normalized_count = result
         self.report({'INFO'}, f"Normalized {normalized_count} animation curves from frame {start_frame} to {end_frame}")
         return {'FINISHED'}
 

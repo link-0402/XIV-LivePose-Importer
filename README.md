@@ -121,6 +121,35 @@ The addon expects `.livepose` files with the following structure:
 }
 ```
 
+### How transforms are applied (important)
+
+In-game, SimpleHeels/LivePose applies each stack to the bone's **model-space**
+transform (relative to the skeleton root), not the bone-local transform:
+
+- `model.Position += stack.Position`
+- `model.Rotation = model.Rotation * stack.Rotation` (post-multiplied)
+- `model.Scale += stack.Scale`
+
+Bones are processed parents-first and children follow their parent's change
+(the usual `Propogate: 3` flag). This addon reproduces that behavior exactly:
+
+- GLTF files exported by XAT/VFXEdit store the game's raw bone-local
+  transforms, so the addon converts between Blender's bone-space and the
+  game's model-space per bone (including Blender's bone-direction correction).
+- All stacks of a bone are composed in file order.
+- The offset is baked at every whole frame of the animation (the glTF
+  exporter samples whole frames), which requires the animation's keys to sit
+  on whole frames - applying to an animation therefore also normalizes its
+  keyframe positions (same as the "Normalize Animation" button).
+
+For exact math the addon parses the source GLTF's bind pose (the path is
+remembered when you import through the addon's "Import GLTF" button). If it
+is unavailable, it falls back to the conventions of Blender's default glTF
+import settings. If you import GLTFs manually, keep the importer's
+**Bone Dir setting at its default ("Blender")** - the "Temperance"/"Fortune"
+heuristics do not round-trip cleanly through Blender's glTF exporter even
+without this addon.
+
 ## Troubleshooting
 
 **"No active action found" error:**
@@ -135,8 +164,15 @@ The addon expects `.livepose` files with the following structure:
 - Ensure export folder path exists and is writable
 - Addon will create directories if they don't exist
 
+**The last frame of the animation is missing after re-import:**
+- Caused by fractional keyframe positions in imported glTF animations
+  (e.g. a key at 238.9998 instead of 239). Applying a LivePose to the
+  animation normalizes the keys to whole frames automatically, and the
+  "Normalize Animation" button does the same thing manually.
+
 **Pose looks incorrect:**
 Depending on the skeleton used for the inital creation of the animation as well as the skeleton you exported the animation with, the animation may not correct on your chosen armature (if you choose to have one in the scene for preview) there may be some bones breaking after re-import into the game  That has nothing to do with this addon but rather how XIV handles skeletons / animations. 
+If the limbs look twisted, also check that the glTF was imported with Blender's default "Bone Dir" import setting (see "How transforms are applied" above).
 
 ## License
 
