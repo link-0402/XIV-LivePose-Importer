@@ -16,6 +16,7 @@ import json
 import math
 import mathutils
 import os
+import re
 import struct
 import base64
 import zlib
@@ -534,12 +535,45 @@ def filter_deltas_for_mode(stacks, apply_mode, invert=False):
     return result
 
 
+class _FcurveWriter:
+    """Fast keyframe writer that writes straight into an fcurve.
+
+    Replaces posebone.keyframe_insert(), which tags the depsgraph for every
+    inserted key. Keys are written with LINEAR interpolation and the fcurve
+    is updated once at the end of the bake, so handle state never matters
+    during evaluation.
+    """
+
+    def __init__(self, action, data_path, index):
+        self.fc = action.fcurves.find(data_path, index=index)
+        if self.fc is None:
+            self.fc = action.fcurves.new(data_path, index=index)
+        self.keys = {}
+        for kp in self.fc.keyframe_points:
+            self.keys[round(kp.co[0])] = kp
+
+    def set_value(self, frame, value):
+        kp = self.keys.get(frame)
+        if kp is None:
+            kp = self.fc.keyframe_points.insert(frame, value, options={'FAST'})
+            kp.interpolation = 'LINEAR'
+            self.keys[frame] = kp
+        else:
+            kp.co[1] = value
+            kp.interpolation = 'LINEAR'
+
+    def update(self):
+        self.fc.update()
+
+
 class LivePoseBakeState:
     """Per-frame model-space application of LivePose deltas on an armature.
 
-    Usage: create once per apply operation, then call process_frame() after
-    each scene.frame_set(). Adjusted channels for delta bones are written to
-    the pose bones (caller keyframes them if desired).
+    Usage: create once per apply operation, then call process_frame(bases)
+    per frame with a {bone_name: basis matrix} dict (evaluate_basis() can
+    build it directly from the action's fcurves without a depsgraph update).
+    Adjusted channels for delta bones are written to the pose bones (caller
+    keyframes them if desired).
 
     Forward application: a delta bone's base pose is computed from its
     already-adjusted parent (children follow their parent - "Propogate").
@@ -558,6 +592,32 @@ class LivePoseBakeState:
         self.corrections = compute_bone_corrections(armature, source_gltf_path)
         self.order = bone_topo_order(armature)
 
+        # filtered deltas per bone
+        self.deltas = {
+            name: filter_deltas_for_mode(stacks, apply_mode, invert)
+            for name, stacks in bone_deltas.items()
+        }
+
+        # Only delta bones and their ancestors need per-frame evaluation:
+        # non-delta bones are never rewritten, so their bases only matter
+        # when composing the FK chain of a delta bone.
+        needed = set()
+        for bone_name in self.deltas:
+            bone = armature.data.bones.get(bone_name)
+            while bone is not None:
+                needed.add(bone.name)
+                bone = bone.parent
+        self.needed_order = [name for name in self.order if name in needed]
+
+        # Group the active action's fcurves by bone for direct evaluation
+        self.fcurves_by_bone = {}
+        if armature.animation_data and armature.animation_data.action:
+            for fcurve in armature.animation_data.action.fcurves:
+                match = re.match(r'pose\.bones\["((?:[^"\\]|\\.)*)"\]\.(\w+)$', fcurve.data_path)
+                if match:
+                    bone_name = match.group(1).replace('\\"', '"').replace('\\\\', '\\')
+                    self.fcurves_by_bone.setdefault(bone_name, []).append(fcurve)
+
         # rest data
         self.rest_local = {}      # bone -> armature-space rest matrix
         self.rel_rest = {}        # bone -> rest matrix relative to parent
@@ -570,12 +630,6 @@ class LivePoseBakeState:
                     self.no_inherit_scale.add(bone.name)
             else:
                 self.rel_rest[bone.name] = bone.matrix_local.copy()
-
-        # filtered deltas per bone
-        self.deltas = {
-            name: filter_deltas_for_mode(stacks, apply_mode, invert)
-            for name, stacks in bone_deltas.items()
-        }
 
         self.pose_mats = {}       # bone -> post-delta armature-space matrix (current frame)
         self.prev_quat = {}       # bone -> last written quaternion (sign continuity)
@@ -592,26 +646,69 @@ class LivePoseBakeState:
             return mathutils.Matrix.LocRotScale(t, r, mathutils.Vector((1.0, 1.0, 1.0)))
         return parent_pose
 
-    def process_frame(self):
-        """Compute adjusted pose for the current frame. Must be called after
-        scene.frame_set(); bones are processed parents-first."""
+    def evaluate_basis(self, bone_name, frame):
+        """Evaluate a pose bone's basis (matrix_basis) at the given frame by
+        sampling the action's fcurves directly, avoiding a full depsgraph
+        update per frame. Unanimated channels use the current pose values,
+        matching what the depsgraph would produce."""
+        posebone = self.armature.pose.bones[bone_name]
+        loc = posebone.location.copy()
+        rot = posebone.rotation_quaternion.copy()
+        eul = posebone.rotation_euler.copy()
+        aax = posebone.rotation_axis_angle
+        if isinstance(aax, mathutils.Quaternion):
+            # Blender 4.x stores axis-angle rotation as a quaternion
+            aax = aax.copy()
+        else:
+            # older Blender: plain 4-float array (angle, x, y, z)
+            aax = mathutils.Vector(aax)
+        scl = posebone.scale.copy()
+
+        for fcurve in self.fcurves_by_bone.get(bone_name, ()):
+            channel = fcurve.data_path.rsplit('.', 1)[1]
+            value = fcurve.evaluate(frame)
+            if channel == 'location':
+                loc[fcurve.array_index] = value
+            elif channel == 'rotation_quaternion':
+                rot[fcurve.array_index] = value
+            elif channel == 'rotation_euler':
+                eul[fcurve.array_index] = value
+            elif channel == 'rotation_axis_angle':
+                aax[fcurve.array_index] = value
+            elif channel == 'scale':
+                scl[fcurve.array_index] = value
+
+        mode = posebone.rotation_mode
+        if mode == 'QUATERNION':
+            return mathutils.Matrix.LocRotScale(loc, rot, scl)
+        if mode == 'AXIS_ANGLE':
+            if isinstance(aax, mathutils.Quaternion):
+                # Blender 4.x stores axis-angle rotation as a quaternion
+                return mathutils.Matrix.LocRotScale(loc, aax, scl)
+            axis = mathutils.Vector(aax[1:4])
+            if axis.length > 1e-8:
+                axis.normalize()
+            return mathutils.Matrix.LocRotScale(loc, mathutils.Quaternion(axis, aax[0]), scl)
+        return mathutils.Matrix.LocRotScale(loc, eul.to_quaternion(), scl)
+
+    def process_frame(self, bases):
+        """Compute adjusted pose for the given frame. `bases` maps bone name
+        to its evaluated basis matrix for this frame. Bones are processed
+        parents-first."""
         self.pose_mats = {}
 
-        # Read all channel values and compute the evaluated pose of every
-        # bone BEFORE writing anything (FK evaluation of the current action).
-        bases = {}
+        # Compute the evaluated pose of every needed bone BEFORE writing
+        # anything (FK evaluation of the current action).
         eval_pose = {}
-        for bone_name in self.order:
-            posebone = self.armature.pose.bones[bone_name]
+        for bone_name in self.needed_order:
             bone = self.armature.data.bones[bone_name]
-            basis = posebone.matrix_basis.copy()
-            bases[bone_name] = basis
+            basis = bases[bone_name]
             if bone.parent is not None and bone.parent.name in eval_pose:
                 eval_pose[bone_name] = self._parent_mat(bone_name, eval_pose[bone.parent.name]) @ self.rel_rest[bone_name] @ basis
             else:
                 eval_pose[bone_name] = self.rest_local[bone_name] @ basis
 
-        for bone_name in self.order:
+        for bone_name in self.needed_order:
             posebone = self.armature.pose.bones[bone_name]
             bone = self.armature.data.bones[bone_name]
             stacks = self.deltas.get(bone_name)
@@ -740,13 +837,43 @@ def reset_cplus_scaling(armature):
         posebone.scale = mathutils.Vector((1.0, 1.0, 1.0))
 
 
-def normalize_action_whole_frames(action):
-    """Resample all fcurves of the action so keys sit exactly on whole frames.
+def cplus_scaling_active(armature, scale_dict):
+    """Return True if the armature's pose currently holds the configured
+    CustomizePlus scales (False if it was reset or manually changed)."""
+    if not scale_dict:
+        return False
+    epsilon = 1e-4
+    for posebone in armature.pose.bones:
+        if posebone.name not in scale_dict:
+            continue
+        expected = mathutils.Vector((
+            scale_dict[posebone.name].get('X', 1.0),
+            scale_dict[posebone.name].get('Y', 1.0),
+            scale_dict[posebone.name].get('Z', 1.0),
+        ))
+        if (posebone.scale - expected).length > epsilon:
+            return False
+    return True
+
+
+def normalize_action_whole_frames(action, delta_bones=None):
+    """Resample fcurves of the action so keys sit exactly on whole frames.
 
     Imported glTF animations usually have keys at fractional frames (e.g.
     238.9998 instead of 239) due to float precision. The glTF exporter
     samples animations at whole frames, so keys must be whole-frame aligned
     for baked content to survive the export.
+
+    Only fcurves of delta bones (bones the bake rewrites) need resampling:
+    the bake reads each delta bone's base pose from its fcurve at every
+    frame of the GLOBAL action range, so a delta fcurve must carry a key on
+    every whole frame. Without that, once an adjusted key is written at
+    frame f-1, the fcurve interpolates/extrapolates from that adjusted key
+    instead of evaluating the original value at frame f, re-applying the
+    offset on top of already-adjusted values (cumulative drift).
+
+    Fcurves of non-delta bones are never rewritten by the bake and are
+    exported by sampling, so they are left untouched.
 
     Returns (start_frame, end_frame, normalized_curve_count) or None if the
     action has no keyframes.
@@ -770,12 +897,21 @@ def normalize_action_whole_frames(action):
         if len(fcurve.keyframe_points) == 0:
             continue
 
+        if delta_bones is not None:
+            match = re.match(r'pose\.bones\["((?:[^"\\]|\\.)*)"\]\.(\w+)$', fcurve.data_path)
+            if match is None:
+                continue
+            bone_name = match.group(1).replace('\\"', '"').replace('\\\\', '\\')
+            if bone_name not in delta_bones:
+                continue
+
+        # Resample over the full action range so the fcurve carries a key on
+        # every whole frame (the bake reads the base pose per frame from it)
         frame_values = {}
         for frame in range(start_frame, end_frame + 1):
             frame_values[frame] = fcurve.evaluate(frame)
 
-        while len(fcurve.keyframe_points) > 0:
-            fcurve.keyframe_points.remove(fcurve.keyframe_points[0])
+        fcurve.keyframe_points.clear()
 
         for frame, value in sorted(frame_values.items()):
             keyframe = fcurve.keyframe_points.insert(frame, value)
@@ -953,12 +1089,6 @@ class LivePoseSettings(bpy.types.PropertyGroup):
         default=""
     ) # type: ignore
     
-    apply_cplus_on_import: BoolProperty(
-        name="Apply C+ Scaling on Import",
-        description="Automatically clear animation scale keyframes and apply CustomizePlus scaling",
-        default=False
-    ) # type: ignore
-    
     cplus_scaling_applied: bpy.props.BoolProperty(default=False) # type: ignore
 
 
@@ -1055,7 +1185,10 @@ class LIVEPOSE_PT_MainPanel(bpy.types.Panel):
         box.separator()
         box.label(text='CustomizePlus (C+):', icon='MOD_ARMATURE')
         box.prop(settings, "cplus_string", text="C+ String")
-        box.prop(settings, "apply_cplus_on_import", text="Apply C+ on Import")
+        
+        row = box.row()
+        row.operator("livepose.apply_cplus_scaling", text="Apply C+ Scaling", icon="CHECKMARK")
+        row.operator("livepose.reset_cplus_scaling", text="Reset C+ Scaling", icon="LOOP_BACK")
         
         if settings.cplus_scaling_applied:
             row = box.row()
@@ -1152,7 +1285,11 @@ class LIVEPOSE_OT_ApplyPose(bpy.types.Operator):
 
         # Process the current frame (bones are handled parents-first internally)
         context.view_layer.update()
-        state.process_frame()
+        bases = {
+            name: target_armature.pose.bones[name].matrix_basis.copy()
+            for name in state.needed_order
+        }
+        state.process_frame(bases)
 
         applied_count = len(bone_deltas)
 
@@ -1181,10 +1318,10 @@ class LIVEPOSE_OT_ApplyPose(bpy.types.Operator):
 
         # Normalize the action so all keys sit on whole frames. Imported
         # glTF animations usually have keys at fractional frames (e.g.
-        # 238.9998 instead of 239); keyframe insertion merges into those
-        # nearby keys and the glTF exporter only samples whole frames, so
-        # normalization is required for the bake to cover the full animation.
-        result = normalize_action_whole_frames(action)
+        # 238.9998 instead of 239); the glTF exporter only samples whole
+        # frames, so normalization is required for the bake to cover the
+        # full animation. Only delta-bone fcurves need resampling.
+        result = normalize_action_whole_frames(action, set(bone_deltas.keys()))
         if result is None:
             self.report({'WARNING'}, "No keyframes found in action")
             return {'CANCELLED'}
@@ -1201,24 +1338,50 @@ class LIVEPOSE_OT_ApplyPose(bpy.types.Operator):
 
         modified_bones = set(bone_deltas.keys())
 
-        # Process each frame individually
-        for frame in frame_numbers:
-            # Set to the exact frame to ensure we're reading the correct keyframe values
-            context.scene.frame_set(frame)
-            # Force update to ensure pose is evaluated
-            context.view_layer.update()
+        # Direct fcurve writers instead of keyframe_insert, which tags the
+        # depsgraph for every inserted key
+        writers = {}
+        pose_bones = target_armature.pose.bones
+        if state.want_pos:
+            for bone_name in bone_deltas:
+                path = 'pose.bones["%s"].location' % bone_name
+                for index in range(3):
+                    writers[(bone_name, 'location', index)] = _FcurveWriter(action, path, index)
+        if state.want_rot:
+            for bone_name in bone_deltas:
+                path = 'pose.bones["%s"].rotation_quaternion' % bone_name
+                for index in range(4):
+                    writers[(bone_name, 'rotation_quaternion', index)] = _FcurveWriter(action, path, index)
+        if state.want_scl:
+            for bone_name in bone_deltas:
+                path = 'pose.bones["%s"].scale' % bone_name
+                for index in range(3):
+                    writers[(bone_name, 'scale', index)] = _FcurveWriter(action, path, index)
 
-            state.process_frame()
+        # Process each frame individually. Bases are evaluated directly from
+        # the action's fcurves, so no per-frame depsgraph update is needed.
+        for frame in frame_numbers:
+            bases = {
+                name: state.evaluate_basis(name, frame)
+                for name in state.needed_order
+            }
+            state.process_frame(bases)
 
             # Bake the adjusted channels for all delta bones
             for bone_name in bone_deltas:
-                posebone = target_armature.pose.bones[bone_name]
+                posebone = pose_bones[bone_name]
                 if state.want_pos:
-                    posebone.keyframe_insert(data_path="location", frame=frame)
+                    for index, value in enumerate(posebone.location):
+                        writers[(bone_name, 'location', index)].set_value(frame, value)
                 if state.want_rot:
-                    posebone.keyframe_insert(data_path="rotation_quaternion", frame=frame)
+                    for index, value in enumerate(posebone.rotation_quaternion):
+                        writers[(bone_name, 'rotation_quaternion', index)].set_value(frame, value)
                 if state.want_scl:
-                    posebone.keyframe_insert(data_path="scale", frame=frame)
+                    for index, value in enumerate(posebone.scale):
+                        writers[(bone_name, 'scale', index)].set_value(frame, value)
+
+        for writer in writers.values():
+            writer.update()
 
         # Restore original frame
         context.scene.frame_set(original_frame)
@@ -1260,6 +1423,7 @@ class LIVEPOSE_OT_ResetPose(bpy.types.Operator):
             posebone.scale = mathutils.Vector((1.0, 1.0, 1.0))
         
         settings.pose_was_applied = False
+        settings.cplus_scaling_applied = False
         self.report({'INFO'}, "Armature pose reset to default")
         return {'FINISHED'}
 
@@ -1343,31 +1507,61 @@ class LIVEPOSE_OT_ImportGLTF(bpy.types.Operator, ImportHelper):
                     context.scene.frame_start = int(round(frame_start))
                     context.scene.frame_end = int(round(frame_end))
                     self.report({'INFO'}, f"Set frame range: {int(round(frame_start))} to {int(round(frame_end))}")
-            
-            # Apply CustomizePlus scaling if enabled
-            settings = context.scene.livepose_settings
-            if settings.apply_cplus_on_import and settings.cplus_string:
-                # Parse CustomizePlus string
-                version, cplus_dict = translate_cplus_hash(settings.cplus_string)
-                
-                if version == 4 and cplus_dict:
-                    # Clear scale keyframes from animation if it exists
-                    if armature.animation_data and armature.animation_data.action:
-                        removed = clear_animation_scale_keyframes(armature.animation_data.action)
-                        if removed > 0:
-                            self.report({'INFO'}, f"Cleared {removed} scale keyframes from animation")
-                    
-                    # Apply CustomizePlus scaling
-                    scale_dict = get_cplus_bone_scales(cplus_dict)
-                    applied = apply_cplus_scaling(armature, scale_dict)
-                    settings.cplus_scaling_applied = True
-                    self.report({'INFO'}, f"Applied CustomizePlus scaling to {applied} bones")
-                elif version != 4:
-                    self.report({'WARNING'}, f"CustomizePlus version {version} not supported (expected 4)")
-                else:
-                    self.report({'WARNING'}, "Failed to parse CustomizePlus string")
         
         self.report({'INFO'}, f"Successfully imported and cleaned GLTF: {os.path.basename(self.filepath)}")
+        return {'FINISHED'}
+
+
+class LIVEPOSE_OT_ApplyCPlusScaling(bpy.types.Operator):
+    bl_idname = "livepose.apply_cplus_scaling"
+    bl_label = "Apply C+ Scaling"
+    bl_description = "Clear animation scale keyframes and apply CustomizePlus bone scaling from the C+ string to the armature pose"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        settings = context.scene.livepose_settings
+        return bool(settings.target_armature and settings.cplus_string)
+
+    def execute(self, context):
+        settings = context.scene.livepose_settings
+        target_armature = settings.target_armature
+
+        version, cplus_dict = translate_cplus_hash(settings.cplus_string)
+        if version != 4 or not cplus_dict:
+            self.report({'WARNING'}, f"Failed to parse CustomizePlus string (version {version})")
+            return {'CANCELLED'}
+
+        # Clear scale keyframes from animation if it exists
+        if target_armature.animation_data and target_armature.animation_data.action:
+            removed = clear_animation_scale_keyframes(target_armature.animation_data.action)
+            if removed > 0:
+                self.report({'INFO'}, f"Cleared {removed} scale keyframes from animation")
+
+        # Apply CustomizePlus scaling
+        scale_dict = get_cplus_bone_scales(cplus_dict)
+        applied = apply_cplus_scaling(target_armature, scale_dict)
+        settings.cplus_scaling_applied = True
+        self.report({'INFO'}, f"Applied CustomizePlus scaling to {applied} bones")
+        return {'FINISHED'}
+
+
+class LIVEPOSE_OT_ResetCPlusScaling(bpy.types.Operator):
+    bl_idname = "livepose.reset_cplus_scaling"
+    bl_label = "Reset C+ Scaling"
+    bl_description = "Reset CustomizePlus bone scaling on the armature pose"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        settings = context.scene.livepose_settings
+        return bool(settings.target_armature)
+
+    def execute(self, context):
+        settings = context.scene.livepose_settings
+        reset_cplus_scaling(settings.target_armature)
+        settings.cplus_scaling_applied = False
+        self.report({'INFO'}, "Reset CustomizePlus scaling")
         return {'FINISHED'}
 
 
@@ -1413,9 +1607,24 @@ class LIVEPOSE_OT_ExportGLTF(bpy.types.Operator):
         os.makedirs(export_folder, exist_ok=True)
         
         # Reset CustomizePlus scaling before export if it was applied
-        cplus_was_applied = settings.cplus_scaling_applied
-        if cplus_was_applied:
+        cplus_scale_dict = None
+        if settings.cplus_string:
+            version, cplus_dict = translate_cplus_hash(settings.cplus_string)
+            if version == 4 and cplus_dict:
+                cplus_scale_dict = get_cplus_bone_scales(cplus_dict)
+
+        # Only treat C+ scaling as active if the pose actually carries the
+        # configured scales (the user may have reset the armature after
+        # import, leaving the flag stale)
+        cplus_was_active = (
+            settings.cplus_scaling_applied
+            and cplus_scale_dict
+            and cplus_scaling_active(target_armature, cplus_scale_dict)
+        )
+
+        if cplus_was_active:
             reset_cplus_scaling(target_armature)
+            settings.cplus_scaling_applied = False
             self.report({'INFO'}, "Reset CustomizePlus scaling for export")
         
         # Switch to Object mode if not already (export fails in Pose mode)
@@ -1465,21 +1674,7 @@ class LIVEPOSE_OT_ExportGLTF(bpy.types.Operator):
             )
         except Exception as e:
             self.report({'ERROR'}, f"Failed to export GLTF: {str(e)}")
-            # Re-apply CustomizePlus scaling if it was reset
-            if cplus_was_applied and settings.cplus_string:
-                version, cplus_dict = translate_cplus_hash(settings.cplus_string)
-                if version == 4 and cplus_dict:
-                    scale_dict = get_cplus_bone_scales(cplus_dict)
-                    apply_cplus_scaling(target_armature, scale_dict)
             return {'CANCELLED'}
-        
-        # Re-apply CustomizePlus scaling after successful export
-        if cplus_was_applied and settings.cplus_string:
-            version, cplus_dict = translate_cplus_hash(settings.cplus_string)
-            if version == 4 and cplus_dict:
-                scale_dict = get_cplus_bone_scales(cplus_dict)
-                apply_cplus_scaling(target_armature, scale_dict)
-                self.report({'INFO'}, "Re-applied CustomizePlus scaling after export")
         
         self.report({'INFO'}, f"Successfully exported GLTF: {filename}")
         return {'FINISHED'}
@@ -1607,6 +1802,8 @@ classes = (
     LIVEPOSE_OT_ApplyPose,
     LIVEPOSE_OT_ResetPose,
     LIVEPOSE_OT_ImportGLTF,
+    LIVEPOSE_OT_ApplyCPlusScaling,
+    LIVEPOSE_OT_ResetCPlusScaling,
     LIVEPOSE_OT_ExportGLTF,
     LIVEPOSE_OT_NormalizeAnimation,
     LIVEPOSE_OT_DeleteOtherActions,
