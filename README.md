@@ -1,6 +1,6 @@
 # XIV LivePoser - Blender Addon
 
-Get the latest release here: https://github.com/link-0402/XIV-LivePose-Importer/releases/tag/1.0
+Get the latest release here: https://github.com/link-0402/XIV-LivePose-Importer/releases/tag/1.2
 
 A Blender addon for importing and applying FFXIV LivePose files to armatures, enabling easy pose adjustments for animations created in-game.
 This tool is meant to be used primarily for permanent, simple animation editing rather than the semi-temporary animation-unspecific method that SimpleHeels already provides through livepose. 
@@ -14,13 +14,17 @@ I am in no way associated with the developers behind SimpleHeels, this is just a
   - All transformations (position, rotation, scale)
   - Rotation only
   - Position only
-  - Scale only
   - Rotation + Position
 - **Animation Support**: Apply LivePose offsets to entire animation actions across all keyframes, optionally only for select bones
-- **GLTF Import/Export**: Streamlined workflow with automatic cleanup of unnecessary objects
+- **Current Pose Support**: Turn off "Apply to Animation" to only modify the current pose instead of baking into an action
+- **Invert (Remove)**: Apply the exact inverse of a LivePose to undo a previously applied pose
+- **Per-Bone Toggles**: Enable or disable individual bones from the LivePose file, with "All" / "None" quick-toggle buttons; bones are displayed with human-readable English names
+- **GLTF Import/Export**: Streamlined workflow with automatic cleanup of unnecessary objects; the scene frame range is set automatically from the imported animation
 - **Action Management**: Delete individual or all animation actions (to reset the scene or make identifying the correct timeline on re-import ingame easier)
 - **Automatic Armature Setup**: Automatically configures "Mannequin", "Face" and "Tail" meshes with armature modifier on import
-- **Animation normalization / cleanup**: Cleans up the timeline in case of misplaced keyframes, putting evently spaced keyframes across the length of the animation in order to make them game compatible
+- **CustomizePlus (C+) Integration**: Paste a CustomizePlus string to apply its bone scaling to the armature; scale keyframes are cleared from the animation and the scaling is reset automatically before GLTF export
+- **Reset Armature**: Reset the armature pose back to its default state
+- **Animation normalization / cleanup**: Cleans up the timeline in case of misplaced keyframes, putting evenly spaced keyframes across the length of the animation in order to make them game compatible
 
 ## Requirements
 
@@ -34,7 +38,7 @@ I am in no way associated with the developers behind SimpleHeels, this is just a
 1. Download the addon files
 2. In Blender, go to `Edit > Preferences > Add-ons`
 3. Click `Install` and select the downloaded zip archive
-4. Enable the addon by checking the box next to "Rigging: LivePose Importer" (typically happens automatically)
+4. Enable the addon by checking the box next to "XIV LivePose Importer" (typically happens automatically)
 
 ## Usage
 
@@ -43,31 +47,32 @@ I am in no way associated with the developers behind SimpleHeels, this is just a
 0. Export the animation from the game through either XAT (no clue) or VFXEdit (PapEditor Tab -> load pap file -> Motion)
    You need to load up the correct skeleton for the animation now, otherwise there will be issues. 
    Figuring out which one is correct can be a bit of trial and error, I usually try the IVCS 0101 (Midlander M) or or YAS / YAS+NLFB 0201 (Midlander F) and 0801 (Miqo'te F) skeletons.
-   Keep in mind that if you use a skeleton that's not for Midlander Female, most Mannequins will deform unnaturally, but the animation itself might still be completely fine. You'll get a feel for it as you go. 
-   Export the animation. Make sure to export all bones, including unused ones.
+   Keep in mind that if you use a skeleton that's not for Midlander Male or Female, most Mannequins will deform unnaturally, but the animation itself might still be completely fine. This is only an issue with the preview in Blender and you can mostly ignore it. You'll get a feel for it as you go. 
+   Export the animation.
 
 2. **Select Target Armature**
    - In the 3D Viewport sidebar (press `N`), navigate to the "LivePose" tab
    - Import a GLTF file through the importer
    - Select your target armature from the dropdown (if it didn't happen automatically)
-   - Set the armature under the armature modifier of your Mannequin if you want a preview (recommended). If the body is called "Mannequin" this will happen automatically.
+   - Set the armature under the armature modifier of your Mannequin if you want a preview (recommended). If the body is called "Mannequin" this will happen automatically
 
 3. **Load LivePose File**
    - Click the folder icon to browse for your `.livepose` file
    - LivePose files are JSON format exported from FFXIV tools
 
 4. **Choose Apply Mode**
-   - Select which transformations to apply (default: Rotation Only)
-     I would recommend only using rotations or an offset to the root bone (n_hara) to do height adjustments, everything else looks unnatural.
+   - Select which transformations to apply based on the adjustments you made in LivePose. This will ususally be rotations only, or position to adjust some props or change the base height through the root bone.
    - You can toggle off adjustments for certain bones contained within the livepose file from the list if necessary
 
 5. **Apply the Pose**
    - Click "Apply LivePose" to apply transformations
    - I recommend inspecting the animation / timeline in Pose Mode afterwards. If it contains too many or incorrectly placed keyframes hit "Normalize Animation", that will correct the timeline and provide evenly spaced keyframes across the entire animation. 
+   - Tick "Invert (Remove)" and click "Apply LivePose" again to undo a previously applied pose (or just hit Ctrl Z)
    - Export the animation and re-import it ingame
 
-6. Import the pose back into the game, once again selecting all bones, including previously unused ones.
-   If the feet / toes or genitalia deform unnaturally, you might need to add them to a bone exclusion list. See https://xivmodding.com/books/ff14-asset-reference-document/page/bone-list-and-bone-scaling-notes for the list of bones.
+6. Import the pose back into the game. 
+   If anything you didn't edit, like toes or genitalia deform unnaturally, you might need to add them to a bone exclusion list. See https://xivmodding.com/books/ff14-asset-reference-document/page/bone-list-and-bone-scaling-notes for the list of bones.
+   This happens due to a skeleton mismatch, but should be fixed by automatically picking the correct skeleton in future versions of VFXEditor (sorry, XAT folks).
   
 ## Technical Details
 
@@ -104,8 +109,7 @@ transform (relative to the skeleton root), not the bone-local transform:
 - `model.Rotation = model.Rotation * stack.Rotation` (post-multiplied)
 - `model.Scale += stack.Scale`
 
-Bones are processed parents-first and children follow their parent's change
-(the usual `Propogate: 3` flag). This addon reproduces that behavior exactly:
+Bones are processed parents-first and children follow their parent's change.
 
 - GLTF files exported by XAT/VFXEdit store the game's raw bone-local
   transforms, so the addon converts between Blender's bone-space and the
@@ -123,6 +127,14 @@ import settings. If you import GLTFs manually, keep the importer's
 **Bone Dir setting at its default ("Blender")** - the "Temperance"/"Fortune"
 heuristics do not round-trip cleanly through Blender's glTF exporter even
 without this addon.
+
+### GLTF Export
+
+The export button exports the target armature and its children as a separate
+`.gltf` (Y-up, with custom properties as extras and the full action range, not
+the scene playback range). It switches to Object mode and deselects everything
+else first, resets any active CustomizePlus scaling, and disables slow options
+such as Draco compression.
 
 ## Troubleshooting
 
@@ -152,12 +164,6 @@ If the limbs look twisted, also check that the glTF was imported with Blender's 
 
 This program is free software; you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation; either version 3 of the License, or (at your option) any later version.
 This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-
-## Credits
-
-**Author**: Luci  
-**Category**: Rigging  
-**Version**: 1.0.0
 
 ## Support
 
